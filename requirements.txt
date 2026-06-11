@@ -1,0 +1,8 @@
+PyQt6>=6.4.0
+pystray>=0.19.4
+Pillow>=9.5.0
+easyocr>=1.7.0
+googletrans==4.0.0-rc1
+keyboard>=0.13.5
+pynput>=1.7.6
+pyperclip>=1.8.2

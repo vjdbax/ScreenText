@@ -1,0 +1,14 @@
+{
+  "hotkeys": {
+    "ocr": "ctrl+alt+s",
+    "translate": "ctrl+alt+t"
+  },
+  "languages": {
+    "ocr": "rus",
+    "translate_target": "en"
+  },
+  "auto_start": false,
+  "window_opacity": 0.3,
+  "border_color": "#FF0000",
+  "translate_window_duration": 5000
+}
