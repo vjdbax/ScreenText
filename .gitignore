@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.spec
+installer/
+*.log
+easyocr_models/model/*.pth
+easyocr_models/model/*.onnx
+.installed_marker
+start.bat.TXT
+build.bat.TXT
