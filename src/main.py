@@ -12,22 +12,16 @@ from PyQt6.QtGui import QIcon
 
 # Импортируем qtawesome для стильных векторных иконок
 import qtawesome as qta
+from utils import get_resource_path, get_data_dir
 
 
 def main():
     """Главная функция запуска приложения"""
-    # Устанавливаем путь к директории приложения
-    if getattr(sys, 'frozen', False):
-        # Если приложение упаковано в PyInstaller
-        project_root = os.path.dirname(sys.executable)
-    else:
-        # Если запускается как скрипт
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    
+    project_root = get_resource_path("")
     os.chdir(project_root)
-    
-    # Гарантируем наличие папки assets
-    assets_dir = os.path.join(project_root, "assets")
+
+    # Гарантируем наличие папки assets (в dev — рядом с исходниками)
+    assets_dir = get_resource_path("assets")
     os.makedirs(assets_dir, exist_ok=True)
     
     icon_png = os.path.join(assets_dir, "icon.png")
@@ -38,11 +32,9 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     
     # Генерация стильной иконки на лету (если файлов нет на диске)
-    # Мы используем стильный значок переводчика 'fa5s.language' в фирменном синем цвете VS Code
     try:
         icon_theme = qta.icon('fa5s.language', color='#007ACC')
         
-        # Если картинок на диске нет, генерируем их из вектора в высоком качестве
         if not os.path.exists(icon_png):
             icon_theme.pixmap(256, 256).save(icon_png, "PNG")
             
@@ -51,7 +43,6 @@ def main():
             
         app.setWindowIcon(icon_theme)
     except Exception as e:
-        # Резервный план на случай сбоя
         if os.path.exists(icon_png):
             app.setWindowIcon(QIcon(icon_png))
         else:

@@ -37,14 +37,27 @@ class HotkeyManager:
             return False
     
     def unregister_hotkey(self, action: str) -> bool:
-        """Отмена регистрации горячей клавиши"""
+        """Отмена регистрации горячей клавиши (идемпотентный и безопасный метод)"""
         try:
-            if action in self.hotkeys:
-                keyboard.remove_hotkey(self.hotkeys[action])
-                del self.hotkeys[action]
-                self.logger.info(f"Отменена регистрация горячей клавиши: {action}")
-                return True
-            return False
+            if action not in self.hotkeys:
+                self.logger.debug(f"Горячая клавиша {action} не найдена в реестре, пропуск")
+                return False
+            
+            hotkey_str = self.hotkeys[action]
+            
+            # Пытаемся удалить из библиотеки keyboard (может не существовать)
+            try:
+                keyboard.remove_hotkey(hotkey_str)
+                self.logger.info(f"Отменена регистрация горячей клавиши: {action} -> {hotkey_str}")
+            except KeyError:
+                # Горячая клавиша не была зарегистрирована в keyboard - это нормально
+                self.logger.debug(f"Горячая клавиша {hotkey_str} не найдена в keyboard (возможно, не была зарегистрирована)")
+            except Exception as e:
+                self.logger.warning(f"Предупреждение при удалении горячей клавиши {hotkey_str}: {e}")
+            
+            # Удаляем из нашего словаря в любом случае
+            del self.hotkeys[action]
+            return True
         except Exception as e:
             self.logger.error(f"Ошибка отмены регистрации горячей клавиши {action}: {e}")
             return False

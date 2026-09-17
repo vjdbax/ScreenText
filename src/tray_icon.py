@@ -6,6 +6,7 @@ from PyQt6.QtGui import QIcon, QAction
 from PyQt6.QtCore import QObject, pyqtSignal
 import qtawesome as qta
 from settings import settings
+from utils import get_resource_path
 
 class TrayIcon(QSystemTrayIcon):
     show_settings = pyqtSignal()
@@ -16,11 +17,7 @@ class TrayIcon(QSystemTrayIcon):
         try:
             icon = qta.icon('fa5s.language', color='#007ACC')
         except Exception:
-            if getattr(sys, 'frozen', False):
-                project_root = os.path.dirname(sys.executable)
-            else:
-                project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            icon_path = os.path.join(project_root, "assets", "icon.png")
+            icon_path = get_resource_path(os.path.join("assets", "icon.png"))
             if os.path.exists(icon_path): icon = QIcon(icon_path)
             else: icon = app.style().standardIcon(app.style().StandardPixmap.SP_ComputerIcon)
                 

@@ -5,6 +5,7 @@ Translation management for ScreenText Helper
 
 import logging
 import re
+import time
 from typing import Optional, Dict, Any
 from deep_translator import GoogleTranslator
 from settings import settings
@@ -128,10 +129,35 @@ class TranslatorManager:
             ocr_lang = settings.get_ocr_language()
             src_lang = mymemory_langs.get('ru' if ocr_lang == 'rus' else 'en', 'english')
             tgt_lang = mymemory_langs.get(target, 'english')
-            result = MyMemoryTranslator(source=src_lang, target=tgt_lang).translate(text)
-            if result and "INVALID SOURCE LANGUAGE" not in result and "MYMEMORY WARNING" not in result:
-                return result
-            self.logger.error(f"MyMemory вернул ошибку: {result}")
+
+            if len(text) > 450:
+                paragraphs = text.split('\n')
+                translated_parts = []
+                current_chunk = ""
+
+                for p in paragraphs:
+                    if len(current_chunk) + len(p) + 1 < 450:
+                        current_chunk += (p + "\n")
+                    else:
+                        if current_chunk.strip():
+                            res = MyMemoryTranslator(source=src_lang, target=tgt_lang).translate(current_chunk.strip())
+                            if res and "INVALID SOURCE LANGUAGE" not in res and "MYMEMORY WARNING" not in res:
+                                translated_parts.append(res)
+                            else:
+                                self.logger.error(f"MyMemory chunk error: {res}")
+                        current_chunk = p + "\n"
+                if current_chunk.strip():
+                    res = MyMemoryTranslator(source=src_lang, target=tgt_lang).translate(current_chunk.strip())
+                    if res and "INVALID SOURCE LANGUAGE" not in res and "MYMEMORY WARNING" not in res:
+                        translated_parts.append(res)
+                    else:
+                        self.logger.error(f"MyMemory chunk error: {res}")
+                return "\n".join(translated_parts) if translated_parts else None
+            else:
+                result = MyMemoryTranslator(source=src_lang, target=tgt_lang).translate(text)
+                if result and "INVALID SOURCE LANGUAGE" not in result and "MYMEMORY WARNING" not in result:
+                    return result
+                self.logger.error(f"MyMemory вернул ошибку: {result}")
         except Exception as e:
             self.logger.error(f"MyMemory ошибка: {e}")
         return None
@@ -190,16 +216,24 @@ class TranslatorManager:
             return None
 
     def _try_google(self, text: str, target: str) -> Optional[str]:
-        try:
-            translated = GoogleTranslator(source='auto', target=target).translate(text)
-            if translated:
-                error_markers = ["error 500", "error 429", "server error", "that's an error", "please try again later"]
-                if any(marker in translated.lower() for marker in error_markers):
-                    self.logger.error(f"Google вернул ошибку")
-                    return None
-                return translated
-        except Exception as e:
-            self.logger.error(f"Google ошибка: {e}")
+        for attempt in range(2):
+            try:
+                translated = GoogleTranslator(source='auto', target=target).translate(text)
+                if translated:
+                    error_markers = ["error 500", "error 429", "server error", "that's an error", "please try again later"]
+                    if any(marker in translated.lower() for marker in error_markers):
+                        self.logger.error(f"Google вернул ошибку")
+                        if attempt == 0:
+                            time.sleep(0.5)
+                            continue
+                        return None
+                    return translated
+            except Exception as e:
+                self.logger.error(f"Google ошибка: {e}")
+                if attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                return None
         return None
 
     def _try_deepl(self, text: str, target: str) -> Optional[str]:

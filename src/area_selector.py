@@ -1,460 +1,809 @@
 #!/usr/bin/env python3
 """
-Area selector module - реализация выбора области как в Scissors/Ножницах
+Multi-screen area selector — one overlay widget per monitor.
+
+Architecture (like Lightshot / ShareX):
+  AreaSelector          – manager, same public API as before
+  ScreenCoverWidget     – one frameless fullscreen widget per physical screen,
+                          shows the per-screen screenshot + darkening overlay,
+                          forwards mouse events in global virtual-desktop coords.
+
+Selection rectangle lives in **global (virtual-desktop) coordinates** and may
+span several monitors.  Each ScreenCoverWidget paints the portion of the
+selection that overlaps its own screen geometry.
 """
 
 import sys
-import logging
-from PyQt6.QtWidgets import QWidget, QApplication, QVBoxLayout, QLabel, QHBoxLayout, QPushButton
-from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, pyqtSignal
-from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QCursor, QPixmap, QScreen
-from PIL import Image, ImageGrab
-import tempfile
 import os
+import logging
+import tempfile
+from enum import Enum, auto
+from typing import List, Optional, Dict
 
+from PyQt6.QtWidgets import QWidget, QApplication, QPushButton, QHBoxLayout
+from PyQt6.QtCore import Qt, QRect, QPoint, pyqtSignal, QTimer, QBuffer, QIODevice
+from PyQt6.QtGui import (
+    QPainter, QColor, QPen, QFont, QCursor, QPixmap,
+    QGuiApplication, QPolygon, QRegion, QScreen, QImage,
+)
+from PIL import Image
+
+
+# ── constants ────────────────────────────────────────────────────────────
+
+class _Handle(Enum):
+    TOP_LEFT = auto()
+    TOP = auto()
+    TOP_RIGHT = auto()
+    RIGHT = auto()
+    BOTTOM_RIGHT = auto()
+    BOTTOM = auto()
+    BOTTOM_LEFT = auto()
+    LEFT = auto()
+
+
+HANDLE_SIZE = 8
+_MIN_SEL = 10
+_MASK_ALPHA = 100
+_HINT_ALPHA = 153
+
+
+# ── per-screen overlay widget ───────────────────────────────────────────
+
+class ScreenCoverWidget(QWidget):
+    """
+    Fullscreen frameless widget covering exactly **one** monitor.
+
+    It draws:
+      1. The screenshot of that monitor (background).
+      2. A semi-transparent darkening mask over the whole screen.
+      3. The clear (un-darkened) selection rectangle where it overlaps this screen.
+      4. Resize handles when in "adjusting" phase.
+
+    All coordinates are translated from global virtual-desktop coords to
+    widget-local coords using the screen geometry offset.
+    """
+
+    # Emitted when mouse events happen — manager translates to global coords
+    mouse_pressed = pyqtSignal(QPoint)   # global
+    mouse_moved = pyqtSignal(QPoint)     # global
+    mouse_released = pyqtSignal(QPoint)  # global
+    mouse_double_clicked = pyqtSignal(QPoint)
+    escape_pressed = pyqtSignal()
+
+    def __init__(self, screen: QScreen, screenshot_pixmap: QPixmap,
+                 sel_rect_global: QRect, phase: str,
+                 handle_rects_global: Dict[_Handle, QRect],
+                 parent=None):
+        super().__init__(parent)
+        self._screen = screen
+        self._sg = screen.geometry()          # logical geometry of this screen
+        self._screenshot_pixmap = screenshot_pixmap
+        self._sel_rect_global = sel_rect_global
+        self._phase = phase
+        self._handle_rects_global = handle_rects_global
+
+        self._mask_color = QColor(0, 0, 0, _MASK_ALPHA)
+        self._border_color = QColor(0, 150, 255)
+        self._border_width = 2
+        self._handle_fill = QColor(0, 150, 255, 220)
+        self._handle_border = QColor(255, 255, 255, 200)
+
+        self._setup_window()
+
+    def _setup_window(self):
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_MouseTracking, True)
+        self.setMouseTracking(True)
+        # Place exactly over this screen
+        self.setGeometry(self._sg)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    # ── coordinate translation ──────────────────────────────────────
+
+    def _global_to_local(self, gpt: QPoint) -> QPoint:
+        return gpt - self._sg.topLeft()
+
+    def _local_to_global(self, lpt: QPoint) -> QPoint:
+        return lpt + self._sg.topLeft()
+
+    # ── external update (called by manager) ─────────────────────────
+
+    def update_selection(self, sel_rect_global: QRect, phase: str,
+                         handle_rects_global: Dict[_Handle, QRect]):
+        self._sel_rect_global = sel_rect_global
+        self._phase = phase
+        self._handle_rects_global = handle_rects_global
+        self.update()
+
+    # ── painting ────────────────────────────────────────────────────
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        local_w, local_h = self.width(), self.height()
+
+        # 1) Draw screenshot (already cropped to this screen by manager)
+        if self._screenshot_pixmap and not self._screenshot_pixmap.isNull():
+            painter.drawPixmap(0, 0, self._screenshot_pixmap)
+
+        # 2) Darkening mask + clear selection area
+        sel_local = self._sel_rect_global.translated(-self._sg.x(), -self._sg.y())
+
+        if sel_local.isValid() and sel_local.width() > 1 and sel_local.height() > 1:
+            # Full-screen dark mask
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self._mask_color)
+            painter.drawRect(self.rect())
+
+            # Clear the selection region (un-darken)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+            painter.drawRect(sel_local)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+
+            # Selection border
+            painter.setPen(QPen(self._border_color, self._border_width))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(sel_local)
+
+            # Resize handles
+            if self._phase == "adjusting":
+                self._draw_handles(painter, sel_local)
+        else:
+            # No selection yet — just dark mask + hint
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self._mask_color)
+            painter.drawRect(self.rect())
+            self._draw_hint(painter)
+
+        painter.end()
+
+    def _draw_handles(self, painter: QPainter, sel_local: QRect):
+        painter.setPen(QPen(self._handle_border, 1))
+        painter.setBrush(self._handle_fill)
+        s = HANDLE_SIZE
+        hs = s // 2
+        r = sel_local
+        handle_points = {
+            _Handle.TOP_LEFT:     (r.x() - hs,          r.y() - hs),
+            _Handle.TOP:          (r.x() + r.width()//2 - hs, r.y() - hs),
+            _Handle.TOP_RIGHT:    (r.right() - hs,       r.y() - hs),
+            _Handle.RIGHT:        (r.right() - hs,       r.y() + r.height()//2 - hs),
+            _Handle.BOTTOM_RIGHT: (r.right() - hs,       r.bottom() - hs),
+            _Handle.BOTTOM:       (r.x() + r.width()//2 - hs, r.bottom() - hs),
+            _Handle.BOTTOM_LEFT:  (r.x() - hs,           r.bottom() - hs),
+            _Handle.LEFT:         (r.x() - hs,           r.y() + r.height()//2 - hs),
+        }
+        for hx, hy in handle_points.values():
+            painter.drawEllipse(hx, hy, s, s)
+
+    def _draw_hint(self, painter: QPainter):
+        text = "Выделите область мышью  |  Esc — отмена"
+        font = QFont("Segoe UI", 10)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        tw = metrics.horizontalAdvance(text)
+        th = metrics.height()
+        px, py = 14, 8
+        pill_w, pill_h = tw + px * 2, th + py * 2
+
+        margin = 20
+        pill_x = self.width() - margin - pill_w
+        pill_y = self.height() - margin - pill_h
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, _HINT_ALPHA))
+        painter.drawRoundedRect(pill_x, pill_y, pill_w, pill_h, 6, 6)
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(
+            QRect(pill_x + px, pill_y + py, tw, th),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            text,
+        )
+
+    # ── mouse → global coords ───────────────────────────────────────
+
+    def _pos_to_global(self, event) -> QPoint:
+        return self._local_to_global(event.position().toPoint())
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.mouse_pressed.emit(self._pos_to_global(event))
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        self.mouse_moved.emit(self._pos_to_global(event))
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.mouse_released.emit(self._pos_to_global(event))
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self.mouse_double_clicked.emit(self._pos_to_global(event))
+        super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.escape_pressed.emit()
+        super().keyPressEvent(event)
+
+
+# ── main manager ─────────────────────────────────────────────────────────
 
 class AreaSelector(QWidget):
     """
-    Окно для выбора области экрана как в Scissors
-    Поддерживает:
-    - Затемнение всего экрана кроме выделенной области
-    - Рисование прямоугольника мышкой
-    - Визуальную обратную связь
-    - Отмену по Esc
+    Multi-screen area selector manager.
+
+    Public API is identical to the old single-widget version:
+      - area_captured(str, QPoint, tuple)
+      - area_selection_canceled()
+      - start_capture() -> bool
+      - isVisible()
     """
-    
-    # Сигнал о завершении выбора области (передает путь к скриншоту, координаты x, y и логические размеры width, height)
-    area_selected = pyqtSignal(str, int, int, int, int)
+
+    area_captured = pyqtSignal(str, QPoint, tuple)
     area_selection_canceled = pyqtSignal()
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.logger = logging.getLogger(__name__)
-        self.setup_window()
-        self.setup_variables()
-        
-    def setup_window(self):
-        """Настройка окна"""
-        # Устанавливаем флаги для полноэкранного режима
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool |
-            Qt.WindowType.NoDropShadowWindowHint
-        )
-        
-        # Устанавливаем размер экрана
-        screen = QApplication.primaryScreen().geometry()
-        self.setGeometry(0, 0, screen.width(), screen.height())
-        
-        # Делаем фон полупрозрачным
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        
-        # Включаем обработку событий мыши
-        self.setAttribute(Qt.WidgetAttribute.WA_MouseTracking, True)
-        
-    def setup_variables(self):
-        """Инициализация переменных"""
-        self.selection_start = None
-        self.selection_end = None
-        self.is_selecting = False
-        self.current_rect = QRect()
-        self.screenshot_path = None
-        
-        # Флаг для предотвращения ложного срабатывания отмены в closeEvent
-        self.selection_completed = False
-        
-        # Цвета из настроек
-        self.mask_color = QColor(0, 0, 0, 180)  # Полупрозрачный черный
-        self.border_color = QColor(255, 0, 0)    # Красная рамка
-        self.border_width = 2
-        self.corner_size = 10
-        
-    def capture_screen(self):
-        """Захватываем весь экран как фон"""
+        self._phase = "idle"
+        self._cover_widgets: List[ScreenCoverWidget] = []
+        self._toolbar_widget: Optional[QWidget] = None
+        self._btn_confirm: Optional[QPushButton] = None
+        self._btn_cancel: Optional[QPushButton] = None
+
+        # Selection in global virtual-desktop coordinates
+        self._sel_start = QPoint()
+        self._sel_rect = QRect()
+
+        # Drag state (for resize handles / move)
+        self._drag_start = QPoint()
+        self._drag_rect_snapshot = QRect()
+        self._active_handle: Optional[_Handle] = None
+        self._hover_handle: Optional[_Handle] = None
+
+        # Per-screen screenshots keyed by screen name
+        self._screen_pixmaps: Dict[str, QPixmap] = {}
+        self._screen_shots: List[str] = []       # фоновые скриншоты мониторов
+        self._crop_path: Optional[str] = None    # вырезанный кроп для перевода
+
+        # Virtual-desktop bounding rect
+        self._vd_rect = QRect()
+
+    # ==================================================================
+    # Public API
+    # ==================================================================
+
+    def start_capture(self) -> bool:
         try:
-            # Добавлен параметр all_screens=True для захвата фонового скриншота со всех мониторов
-            screenshot = ImageGrab.grab(all_screens=True)
-            
-            # Сохраняем во временный файл
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
-                screenshot.save(temp_file.name)
-                self.screenshot_path = temp_file.name
-            
-            self.logger.info(f"Скриншот экрана сохранен: {self.screenshot_path}")
-            return True
-        except Exception as e:
-            self.logger.error(f"Ошибка захвата экрана: {e}")
-            return False
-    
-    def paintEvent(self, event):
-        """Рисование интерфейса"""
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
-        # 1. Рисуем фон (скриншот)
-        if self.screenshot_path and os.path.exists(self.screenshot_path):
-            pixmap = QPixmap(self.screenshot_path)
-            painter.drawPixmap(0, 0, pixmap)
-        
-        # 2. Рисуем затемнение (маску)
-        if self.selection_start and self.selection_end:
-            # Рассчитываем прямоугольник выделения
-            selection_rect = QRect(
-                min(self.selection_start.x(), self.selection_end.x()),
-                min(self.selection_start.y(), self.selection_end.y()),
-                abs(self.selection_end.x() - self.selection_start.x()),
-                abs(self.selection_end.y() - self.selection_start.y())
-            )
-            
-            # Рисуем черную маску с отверстием для выделенной области
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(self.mask_color)
-            
-            # Рисуем верхнюю часть маски
-            painter.drawRect(0, 0, self.width(), selection_rect.top())
-            
-            # Рисуем левую часть маски
-            painter.drawRect(0, selection_rect.top(), selection_rect.left(), selection_rect.height())
-            
-            # Рисуем правую часть маски
-            painter.drawRect(selection_rect.right(), selection_rect.top(), 
-                          self.width() - selection_rect.right(), selection_rect.height())
-            
-            # Рисуем нижнюю часть маски
-            painter.drawRect(0, selection_rect.bottom(), self.width(), 
-                          self.height() - selection_rect.bottom())
-            
-            # 3. Рисуем рамку выделенной области
-            painter.setPen(QPen(self.border_color, self.border_width))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(selection_rect)
-            
-            # 4. Рисуем углы прямоугольника для лучшей видимости
-            painter.setBrush(self.border_color)
-            
-            # Левый верхний угол
-            painter.drawRect(selection_rect.left(), selection_rect.top(), 
-                           self.corner_size, self.corner_size)
-            
-            # Правый верхний угол  
-            painter.drawRect(selection_rect.right() - self.corner_size, selection_rect.top(),
-                           self.corner_size, self.corner_size)
-            
-            # Левый нижний угол
-            painter.drawRect(selection_rect.left(), selection_rect.bottom() - self.corner_size,
-                           self.corner_size, self.corner_size)
-            
-            # Правый нижний угол
-            painter.drawRect(selection_rect.right() - self.corner_size, selection_rect.bottom() - self.corner_size,
-                           self.corner_size, self.corner_size)
-            
-            # 5. Рисуем информацию о размере
-            self.draw_size_info(painter, selection_rect)
-    
-    def draw_size_info(self, painter, rect):
-        """Рисование информации о размере выделенной области"""
-        try:
-            # Создаем текст с размерами
-            width = rect.width()
-            height = rect.height()
-            size_text = f"{width} × {height}"
-            
-            # Устанавливаем шрифт
-            font = QFont("Arial", 12, QFont.Weight.Bold)
-            painter.setFont(font)
-            
-            # Рассчитываем позицию для текста (в центре прямоугольника)
-            text_rect = QRect(rect.left() + 10, rect.top() + 10, rect.width() - 20, 30)
-            
-            # Рисуем фон для текста
-            painter.setBrush(QColor(0, 0, 0, 180))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRoundedRect(text_rect, 5, 5)
-            
-            # Рисуем текст
-            painter.setPen(QColor(255, 255, 255))  # Белый текст
-            painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, size_text)
-            
-        except Exception as e:
-            self.logger.error(f"Ошибка рисования информации о размере: {e}")
-    
-    def mousePressEvent(self, event):
-        """Обработка нажатия мыши"""
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.selection_start = event.pos()
-            self.selection_end = event.pos()
-            self.is_selecting = True
-            self.update()
-    
-    def mouseMoveEvent(self, event):
-        """Обработка движения мыши"""
-        if self.is_selecting:
-            self.selection_end = event.pos()
-            self.current_rect = QRect(
-                min(self.selection_start.x(), self.selection_end.x()),
-                min(self.selection_start.y(), self.selection_end.y()),
-                abs(self.selection_end.x() - self.selection_start.x()),
-                abs(self.selection_end.y() - self.selection_start.y())
-            )
-            self.update()
-    
-    def mouseReleaseEvent(self, event):
-        """Обработка отпускания кнопки мыши"""
-        if event.button() == Qt.MouseButton.LeftButton and self.is_selecting:
-            self.selection_end = event.pos()
-            self.is_selecting = False
-            
-            # Получаем координаты выделенной области
-            x = min(self.selection_start.x(), self.selection_end.x())
-            y = min(self.selection_start.y(), self.selection_end.y())
-            width = abs(self.selection_end.x() - self.selection_start.x())
-            height = abs(self.selection_end.y() - self.selection_start.y())
-            
-            # Проверяем, что область имеет минимальный размер
-            if width > 10 and height > 10:
-                self.selection_completed = True
-                
-                # Скрываем селектор, чтобы убрать маску, рамки и текст размеров
-                self.hide()
-                # Принудительно заставляем Qt обновить экран без нашего окна
-                QApplication.processEvents()
-                
-                try:
-                    # Динамически вычисляем коэффициент масштабирования DPI
-                    # Сравниваем физический размер картинки Pillow с логическим размером экрана Qt
-                    img = Image.open(self.screenshot_path)
-                    physical_w, physical_h = img.size
-                    
-                    virtual_geom = QApplication.primaryScreen().virtualGeometry()
-                    logical_w = virtual_geom.width()
-                    logical_h = virtual_geom.height()
-                    
-                    # Точные коэффициенты масштаба по осям X и Y
-                    ratio_x = physical_w / logical_w
-                    ratio_y = physical_h / logical_h
-                    
-                    # Переводим логические координаты Qt в точные физические пиксели скриншота
-                    px = int(x * ratio_x)
-                    py = int(y * ratio_y)
-                    pwidth = int(width * ratio_x)
-                    pheight = int(height * ratio_y)
-                    
-                    # Кропаем оригинальный чистый фоновый скриншот
-                    cropped_img = img.crop((px, py, px + pwidth, py + pheight))
-                    
-                    # Сохраняем во временный файл
-                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
-                        cropped_img.save(temp_file.name)
-                        cropped_path = temp_file.name
-                    
-                    # Передаем готовый чистый скриншот, логические координаты x, y и логические размеры
-                    self.area_selected.emit(cropped_path, x, y, width, height)
-                    
-                except Exception as e:
-                    self.logger.error(f"Ошибка кадрирования скриншота: {e}")
-                    self.area_selection_canceled.emit()
-            else:
-                # Если область слишком маленькая, отменяем выбор
-                self.area_selection_canceled.emit()
-            
-            self.close()
-    
-    def keyPressEvent(self, event):
-        """Обработка нажатия клавиш"""
-        if event.key() == Qt.Key.Key_Escape:
-            self.area_selection_canceled.emit()
-            self.close()
-        elif event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
-            if self.current_rect.isValid() and self.current_rect.width() > 10 and self.current_rect.height() > 10:
-                x = self.current_rect.x()
-                y = self.current_rect.y()
-                width = self.current_rect.width()
-                height = self.current_rect.height()
-                self.selection_completed = True
-                
-                # Скрываем селектор и обновим экран
-                self.hide()
-                QApplication.processEvents()
-                
-                try:
-                    img = Image.open(self.screenshot_path)
-                    physical_w, physical_h = img.size
-                    
-                    virtual_geom = QApplication.primaryScreen().virtualGeometry()
-                    logical_w = virtual_geom.width()
-                    logical_h = virtual_geom.height()
-                    
-                    ratio_x = physical_w / logical_w
-                    ratio_y = physical_h / logical_h
-                    
-                    px = int(x * ratio_x)
-                    py = int(y * ratio_y)
-                    pwidth = int(width * ratio_x)
-                    pheight = int(height * ratio_y)
-                    
-                    cropped_img = img.crop((px, py, px + pwidth, py + pheight))
-                    
-                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
-                        cropped_img.save(temp_file.name)
-                        cropped_path = temp_file.name
-                        
-                    self.area_selected.emit(cropped_path, x, y, width, height)
-                except Exception as e:
-                    self.logger.error(f"Ошибка кадрирования скриншота: {e}")
-                    self.area_selection_canceled.emit()
-                    
-                self.close()
-    
-    def closeEvent(self, event):
-        """Обработка закрытия окна"""
-        # Очищаем временный файл со скриншотом
-        if self.screenshot_path and os.path.exists(self.screenshot_path):
-            try:
-                os.unlink(self.screenshot_path)
-            except:
-                pass
-        
-        # Уведомляем о завершении работы, только если выбор НЕ был успешно завершен
-        if not self.selection_completed:
-            self.area_selection_canceled.emit()
-        super().closeEvent(event)
-    
-    def show_selector(self):
-        """Показать селектор области"""
-        try:
-            # Захватываем экран
-            if not self.capture_screen():
-                self.logger.error("Не удалось захватить экран")
+            screens = QGuiApplication.screens()
+            if not screens:
+                self.logger.error("No screens available")
                 return False
-            
-            # Сбрасываем флаг завершения перед показом
-            self.selection_completed = False
-            
-            # Показываем окно
-            self.show()
-            self.setFocus()
-            
-            self.logger.info("Селектор области показан")
+
+            # 1) Compute virtual-desktop bounding rect
+            self._vd_rect = QRect()
+            for s in screens:
+                self._vd_rect = self._vd_rect.united(s.geometry())
+
+            # 2) Capture each screen individually
+            self._capture_screens(screens)
+            if not self._screen_pixmaps:
+                self.logger.error("Failed to capture any screen")
+                return False
+
+            # 3) Reset selection state
+            self._phase = "idle"
+            self._sel_rect = QRect()
+            self._sel_start = QPoint()
+            self._active_handle = None
+
+            # 4) Create per-screen overlay widgets
+            self._create_cover_widgets(screens)
+
+            self.logger.info(
+                f"Area selector shown on {len(self._cover_widgets)} screen(s)"
+            )
             return True
-            
+
         except Exception as e:
-            self.logger.error(f"Ошибка показа селектора области: {e}")
+            self.logger.error(f"Error starting capture: {e}")
+            self._cleanup()
             return False
 
+    def isVisible(self) -> bool:
+        return any(w.isVisible() for w in self._cover_widgets)
 
-class AreaSelectorDialog(QWidget):
-    """
-    Альтернативный вариант селектора области - диалоговое окно
-    """
-    
-    area_selected = pyqtSignal(str, int, int, int, int)
-    area_selection_canceled = pyqtSignal()
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.logger = logging.getLogger(__name__)
-        self.setup_dialog()
-        
-    def setup_dialog(self):
-        """Настройка диалогового окна"""
-        self.setWindowTitle("Выбор области")
-        self.setFixedSize(400, 200)
-        self.setWindowFlags(
-            Qt.WindowType.Dialog |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.FramelessWindowHint
-        )
-        
-        layout = QVBoxLayout()
-        
-        # Информация
-        info_label = QLabel("Нажмите и удерживайте левую кнопку мыши для выбора области\nили нажмите Esc для отмены")
-        info_label.setStyleSheet("font-size: 14px; padding: 20px;")
-        layout.addWidget(info_label)
-        
-        # Кнопки
-        button_layout = QHBoxLayout()
-        
-        cancel_btn = QPushButton("Отмена")
-        cancel_btn.clicked.connect(self.cancel_selection)
-        button_layout.addWidget(cancel_btn)
-        
-        capture_btn = QPushButton("Захватить")
-        capture_btn.clicked.connect(self.capture_selected_area)
-        button_layout.addWidget(capture_btn)
-        
-        layout.addLayout(button_layout)
-        self.setLayout(layout)
-        
-        # Переменные для выделения
-        self.selection_start = None
-        self.selection_end = None
-        self.is_selecting = False
-        
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.selection_start = event.pos()
-            self.selection_end = event.pos()
-            self.is_selecting = True
-    
-    def mouseMoveEvent(self, event):
-        if self.is_selecting:
-            self.selection_end = event.pos()
-            self.update()
-    
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self.is_selecting:
-            self.selection_end = event.pos()
-            self.is_selecting = False
-            self.update()
-    
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        if self.selection_start and self.selection_end:
-            rect = QRect(
-                min(self.selection_start.x(), self.selection_end.x()),
-                min(self.selection_start.y(), self.selection_end.y()),
-                abs(self.selection_end.x() - self.selection_start.x()),
-                abs(self.selection_end.y() - self.selection_start.y())
+    # ==================================================================
+    # Screenshot capture
+    # ==================================================================
+
+    def _capture_screens(self, screens: List[QScreen]):
+        self._screen_pixmaps.clear()
+        self._screen_shots.clear()
+        self._crop_path = None
+
+        for screen in screens:
+            try:
+                # screen.grabWindow(0) — native Qt, correct DPI per screen
+                pixmap = screen.grabWindow(0)
+                if pixmap.isNull():
+                    self.logger.warning(
+                        f"grabWindow returned null for {screen.name()}"
+                    )
+                    continue
+                self._screen_pixmaps[screen.name()] = pixmap
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to grab screen {screen.name()}: {e}"
+                )
+
+    # ==================================================================
+    # Cover-widget creation
+    # ==================================================================
+
+    def _create_cover_widgets(self, screens: List[QScreen]):
+        self._destroy_cover_widgets()
+
+        for screen in screens:
+            name = screen.name()
+            pixmap = self._screen_pixmaps.get(name)
+            if pixmap is None:
+                continue
+
+            w = ScreenCoverWidget(
+                screen=screen,
+                screenshot_pixmap=pixmap,
+                sel_rect_global=self._sel_rect,
+                phase=self._phase,
+                handle_rects_global=self._handle_rects_global(),
             )
-            painter.setPen(QPen(QColor(255, 0, 0), 2))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(rect)
-    
-    def cancel_selection(self):
+            w.mouse_pressed.connect(self._on_mouse_pressed)
+            w.mouse_moved.connect(self._on_mouse_moved)
+            w.mouse_released.connect(self._on_mouse_released)
+            w.mouse_double_clicked.connect(self._on_mouse_double_clicked)
+            w.escape_pressed.connect(self._cancel)
+            self._cover_widgets.append(w)
+            w.show()
+            w.raise_()
+            w.activateWindow()
+
+        # Focus first widget so key events work
+        if self._cover_widgets:
+            self._cover_widgets[0].setFocus()
+
+    def _destroy_cover_widgets(self):
+        for w in self._cover_widgets:
+            w.hide()
+            w.deleteLater()
+        self._cover_widgets.clear()
+
+    # ==================================================================
+    # Global mouse handlers (connected to ScreenCoverWidget signals)
+    # ==================================================================
+
+    def _on_mouse_pressed(self, global_pos: QPoint):
+        if self._phase == "adjusting":
+            h = self._hit_handle(global_pos)
+            if h is not None:
+                # Click on edge/corner handle → start resize
+                self._active_handle = h
+                self._drag_start = global_pos
+                self._drag_rect_snapshot = QRect(self._sel_rect)
+                return
+            else:
+                # Click inside rect or outside → start new selection
+                self._phase = "drawing"
+                self._sel_start = global_pos
+                self._sel_rect = QRect(global_pos, global_pos)
+                self._active_handle = None
+                self._hide_toolbar()
+                self._sync_all()
+                return
+
+        if self._phase == "idle":
+            self._phase = "drawing"
+            self._sel_start = global_pos
+            self._sel_rect = QRect(global_pos, global_pos)
+            self._hide_toolbar()
+            self._sync_all()
+
+    def _on_mouse_moved(self, global_pos: QPoint):
+        if self._phase == "drawing":
+            self._sel_rect = QRect(self._sel_start, global_pos).normalized()
+            self._sync_all()
+            return
+
+        if self._phase == "adjusting":
+            if self._active_handle is not None:
+                delta = global_pos - self._drag_start
+                self._apply_resize(self._active_handle, delta)
+                self._position_toolbar()
+                self._sync_all()
+            else:
+                h = self._hit_handle(global_pos)
+                if h != self._hover_handle:
+                    self._hover_handle = h
+                    cursor = self._cursor_for_handle(h)
+                    for w in self._cover_widgets:
+                        w.setCursor(cursor)
+
+    def _on_mouse_released(self, global_pos: QPoint):
+        if self._phase == "drawing":
+            self._sel_rect = QRect(self._sel_start, global_pos).normalized()
+            if self._sel_rect.width() > _MIN_SEL and self._sel_rect.height() > _MIN_SEL:
+                self._phase = "adjusting"
+                self._position_toolbar()
+            else:
+                self._sel_rect = QRect()
+                self._phase = "idle"
+            self._sync_all()
+            return
+
+        if self._phase == "adjusting" and self._active_handle is not None:
+            self._active_handle = None
+            self._sync_all()
+
+    def _on_mouse_double_clicked(self, global_pos: QPoint):
+        if self._phase == "adjusting" and self._sel_rect.isValid():
+            self._confirm_selection()
+
+    # ==================================================================
+    # Handle geometry & hit-testing (global coords)
+    # ==================================================================
+
+    def _handle_rects_global(self) -> Dict[_Handle, QRect]:
+        r = self._sel_rect
+        if not r.isValid():
+            return {}
+        s = HANDLE_SIZE
+        hs = s // 2
+        return {
+            _Handle.TOP_LEFT:     QRect(r.x() - hs, r.y() - hs, s, s),
+            _Handle.TOP:          QRect(r.x() + r.width() // 2 - hs, r.y() - hs, s, s),
+            _Handle.TOP_RIGHT:    QRect(r.right() - hs, r.y() - hs, s, s),
+            _Handle.RIGHT:        QRect(r.right() - hs, r.y() + r.height() // 2 - hs, s, s),
+            _Handle.BOTTOM_RIGHT: QRect(r.right() - hs, r.bottom() - hs, s, s),
+            _Handle.BOTTOM:       QRect(r.x() + r.width() // 2 - hs, r.bottom() - hs, s, s),
+            _Handle.BOTTOM_LEFT:  QRect(r.x() - hs, r.bottom() - hs, s, s),
+            _Handle.LEFT:         QRect(r.x() - hs, r.y() + r.height() // 2 - hs, s, s),
+        }
+
+    def _hit_handle(self, pos: QPoint) -> Optional[_Handle]:
+        """Detect if pos is on a resize handle or near a border edge (8px tolerance)."""
+        r = self._sel_rect
+        if not r.isValid():
+            return None
+
+        # 1) Check explicit handle rectangles first (highest priority)
+        for h, hr in self._handle_rects_global().items():
+            if hr.adjusted(-4, -4, 4, 4).contains(pos):
+                return h
+
+        # 2) Border-tolerance: if within 8px of an edge, treat as that edge's handle
+        border = 8
+        x, y = pos.x(), pos.y()
+        on_left   = abs(x - r.left()) <= border and r.top() <= y <= r.bottom()
+        on_right  = abs(x - r.right()) <= border and r.top() <= y <= r.bottom()
+        on_top    = abs(y - r.top()) <= border and r.left() <= x <= r.right()
+        on_bottom = abs(y - r.bottom()) <= border and r.left() <= x <= r.right()
+
+        # Corners take priority over edges
+        if on_top and on_left:     return _Handle.TOP_LEFT
+        if on_top and on_right:    return _Handle.TOP_RIGHT
+        if on_bottom and on_left:  return _Handle.BOTTOM_LEFT
+        if on_bottom and on_right: return _Handle.BOTTOM_RIGHT
+        if on_top:    return _Handle.TOP
+        if on_bottom: return _Handle.BOTTOM
+        if on_left:   return _Handle.LEFT
+        if on_right:  return _Handle.RIGHT
+
+        return None
+
+    def _cursor_for_handle(self, h: Optional[_Handle]) -> Qt.CursorShape:
+        mapping = {
+            _Handle.TOP_LEFT:     Qt.CursorShape.SizeFDiagCursor,
+            _Handle.TOP:          Qt.CursorShape.SizeVerCursor,
+            _Handle.TOP_RIGHT:    Qt.CursorShape.SizeBDiagCursor,
+            _Handle.RIGHT:        Qt.CursorShape.SizeHorCursor,
+            _Handle.BOTTOM_RIGHT: Qt.CursorShape.SizeFDiagCursor,
+            _Handle.BOTTOM:       Qt.CursorShape.SizeVerCursor,
+            _Handle.BOTTOM_LEFT:  Qt.CursorShape.SizeBDiagCursor,
+            _Handle.LEFT:         Qt.CursorShape.SizeHorCursor,
+        }
+        return mapping.get(h, Qt.CursorShape.CrossCursor)
+
+    # ==================================================================
+    # Resize logic
+    # ==================================================================
+
+    def _apply_resize(self, handle: _Handle, delta: QPoint):
+        r = QRect(self._drag_rect_snapshot)
+        if handle == _Handle.TOP_LEFT:
+            r.setTopLeft(r.topLeft() + delta)
+        elif handle == _Handle.TOP:
+            r.setTop(r.top() + delta.y())
+        elif handle == _Handle.TOP_RIGHT:
+            r.setTopRight(r.topRight() + delta)
+        elif handle == _Handle.RIGHT:
+            r.setRight(r.right() + delta.x())
+        elif handle == _Handle.BOTTOM_RIGHT:
+            r.setBottomRight(r.bottomRight() + delta)
+        elif handle == _Handle.BOTTOM:
+            r.setBottom(r.bottom() + delta.y())
+        elif handle == _Handle.BOTTOM_LEFT:
+            r.setBottomLeft(r.bottomLeft() + delta)
+        elif handle == _Handle.LEFT:
+            r.setLeft(r.left() + delta.x())
+
+        if r.width() >= _MIN_SEL and r.height() >= _MIN_SEL:
+            self._sel_rect = r.normalized()
+
+    # ==================================================================
+    # Sync all cover widgets
+    # ==================================================================
+
+    def _sync_all(self):
+        hr = self._handle_rects_global()
+        for w in self._cover_widgets:
+            w.update_selection(self._sel_rect, self._phase, hr)
+
+    # ==================================================================
+    # Toolbar (floating on primary screen)
+    # ==================================================================
+
+    def _ensure_toolbar(self):
+        if self._toolbar_widget is not None:
+            return
+
+        self._toolbar_widget = QWidget()
+        self._toolbar_widget.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        self._toolbar_widget.setFixedHeight(36)
+        self._toolbar_widget.setStyleSheet(
+            "QWidget { background-color: #1E1E1E; border-radius: 6px; }"
+        )
+
+        lay = QHBoxLayout(self._toolbar_widget)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(6)
+
+        self._btn_confirm = QPushButton("✓ Перевести")
+        self._btn_confirm.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_confirm.setFixedHeight(26)
+        self._btn_confirm.setStyleSheet(
+            "QPushButton { background-color: #0E639C; color: white; border: none; "
+            "border-radius: 4px; padding: 0 14px; font-weight: bold; font-size: 11px; }"
+            "QPushButton:hover { background-color: #1177BB; }"
+        )
+        self._btn_confirm.clicked.connect(self._confirm_selection)
+
+        self._btn_cancel = QPushButton("✕ Отмена")
+        self._btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_cancel.setFixedHeight(26)
+        self._btn_cancel.setStyleSheet(
+            "QPushButton { background-color: #555555; color: #CCCCCC; border: none; "
+            "border-radius: 4px; padding: 0 14px; font-weight: bold; font-size: 11px; }"
+            "QPushButton:hover { background-color: #6E6E6E; color: white; }"
+        )
+        self._btn_cancel.clicked.connect(self._cancel)
+
+        lay.addWidget(self._btn_confirm)
+        lay.addWidget(self._btn_cancel)
+
+    def _position_toolbar(self):
+        if not self._sel_rect.isValid():
+            self._hide_toolbar()
+            return
+
+        self._ensure_toolbar()
+        tw = self._toolbar_widget.sizeHint().width()
+        th = self._toolbar_widget.height()
+
+        # Place below selection, on whichever screen the center is on
+        cx = self._sel_rect.center().x()
+        cy = self._sel_rect.bottom() + 8
+
+        screen = QApplication.screenAt(QPoint(cx, cy)) or QApplication.primaryScreen()
+        sg = screen.geometry()
+
+        tx = max(sg.x() + 4, min(cx - tw // 2, sg.right() - tw - 4))
+        ty = cy
+        if ty + th > sg.bottom():
+            ty = self._sel_rect.top() - th - 8
+
+        self._toolbar_widget.move(tx, ty)
+        self._toolbar_widget.show()
+        self._toolbar_widget.raise_()
+
+    def _hide_toolbar(self):
+        if self._toolbar_widget is not None:
+            self._toolbar_widget.hide()
+
+    # ==================================================================
+    # Confirm / Cancel
+    # ==================================================================
+
+    def _confirm_selection(self):
+        sel = self._sel_rect
+        if not sel.isValid() or sel.width() < _MIN_SEL or sel.height() < _MIN_SEL:
+            return
+
+        self._phase = "confirmed"
+        self._hide_toolbar()
+
+        # Hide all cover widgets
+        for w in self._cover_widgets:
+            w.hide()
+        QApplication.processEvents()
+
+        try:
+            # Determine which screen(s) the selection overlaps
+            screens = QGuiApplication.screens()
+            crop_img = None
+
+            for screen in screens:
+                sg = screen.geometry()
+                intersection = sel.intersected(sg)
+                if intersection.isEmpty():
+                    continue
+
+                name = screen.name()
+                pix = self._screen_pixmaps.get(name)
+                if pix is None or pix.isNull():
+                    continue
+
+                # Convert global intersection to screen-local pixel coords
+                local_x = intersection.x() - sg.x()
+                local_y = intersection.y() - sg.y()
+                local_w = intersection.width()
+                local_h = intersection.height()
+
+                # DPI scaling: pixmap may be larger than logical geometry
+                sx = pix.width() / sg.width() if sg.width() > 0 else 1.0
+                sy = pix.height() / sg.height() if sg.height() > 0 else 1.0
+
+                px1 = int(local_x * sx)
+                py1 = int(local_y * sy)
+                px2 = int((local_x + local_w) * sx)
+                py2 = int((local_y + local_h) * sy)
+
+                # Crop from PIL to handle subpixel precisely
+                pil_img = self._pixmap_to_pil(pix)
+                piece = pil_img.crop((px1, py1, px2, py2))
+
+                if crop_img is None:
+                    crop_img = piece
+                else:
+                    if piece.width() * piece.height() > crop_img.width() * crop_img.height():
+                        crop_img = piece
+
+            if crop_img is None:
+                self.logger.error("No screen data for selection")
+                self.area_selection_canceled.emit()
+                self.close()
+                return
+
+            # Save cropped image to temp file
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                crop_img.save(tmp.name, 'PNG')
+                self._crop_path = tmp.name
+
+            # Physical pixel size of the final crop
+            phys_w, phys_h = crop_img.size
+
+            # Emit result — screen_pos is the global top-left of the selection
+            screen_pos = QPoint(sel.x(), sel.y())
+            self.area_captured.emit(self._crop_path, screen_pos, (phys_w, phys_h))
+            self.logger.info(
+                f"Area captured: {self._crop_path} at ({sel.x()}, {sel.y()}) "
+                f"size {phys_w}x{phys_h}"
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error completing selection: {e}")
+            self.area_selection_canceled.emit()
+
+        self.close()
+
+    def _cancel(self):
+        self._phase = "idle"
+        self._sel_rect = QRect()
+        self._hide_toolbar()
+        self._sync_all()
         self.area_selection_canceled.emit()
         self.close()
-    
-    def capture_selected_area(self):
-        if self.selection_start and self.selection_end:
-            x = min(self.selection_start.x(), self.selection_end.x())
-            y = min(self.selection_start.y(), self.selection_end.y())
-            width = abs(self.selection_end.x() - self.selection_start.x())
-            height = abs(self.selection_end.y() - self.selection_start.y())
-            
-            if width > 10 and height > 10:
-                self.hide()
-                QApplication.processEvents()
-                # Для совместимости сигналов
-                self.area_selected.emit("", x, y, width, height)
-                self.close()
 
+    # ==================================================================
+    # Cleanup
+    # ==================================================================
+
+    @staticmethod
+    def _pixmap_to_pil(pixmap: QPixmap) -> Image.Image:
+        """Convert QPixmap to PIL Image (compatible with all Pillow versions)."""
+        qimg = pixmap.toImage()
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        qimg.save(buffer, "PNG")
+        buffer.close()
+        data = bytes(buffer.data())
+        return Image.open(__import__("io").BytesIO(data))
+
+    def _cleanup(self, keep_crop=False):
+        self._destroy_cover_widgets()
+        if self._toolbar_widget is not None:
+            self._toolbar_widget.hide()
+            self._toolbar_widget.deleteLater()
+            self._toolbar_widget = None
+            self._btn_confirm = None
+            self._btn_cancel = None
+        self._cleanup_screenshots(keep_crop=keep_crop)
+
+    def _cleanup_screenshots(self, keep_crop: bool = False):
+        # Удаляем все фоновые скриншоты мониторов
+        if self._screen_shots:
+            for path in self._screen_shots:
+                if path and os.path.exists(path):
+                    try:
+                        os.unlink(path)
+                    except Exception as e:
+                        self.logger.debug(f"Не удалось удалить фоновый скриншот {path}: {e}")
+            self._screen_shots.clear()
+
+        # Файл кропа удаляем ТОЛЬКО если отмена (keep_crop == False)
+        if not keep_crop and self._crop_path:
+            if os.path.exists(self._crop_path):
+                try:
+                    os.unlink(self._crop_path)
+                except Exception as e:
+                    self.logger.debug(f"Не удалось удалить кроп {self._crop_path}: {e}")
+            self._crop_path = None
+
+        self._screen_pixmaps.clear()
+
+    def closeEvent(self, event):
+        # When closing without confirmation (Esc/cancel), delete all files including crop
+        self._cleanup(keep_crop=(self._phase == "confirmed"))
+        if self._phase != "confirmed":
+            self.area_selection_canceled.emit()
+        super().closeEvent(event)
+
+
+# ── standalone test ──────────────────────────────────────────────────────
 
 def main():
-    """Тестовая функция для демонстрации селектора области"""
     app = QApplication(sys.argv)
-    
-    # Создаем и показываем селектор области
     selector = AreaSelector()
-    selector.area_selected.connect(lambda path, x, y, w, h: print(f"Выбрана область: {path} ({x}, {y}, {w}, {h})"))
-    selector.area_selection_canceled.connect(lambda: print("Выбор области отменен"))
-    
-    if selector.show_selector():
-        print("Селектор области запущен")
+
+    def on_captured(path, pos, size):
+        print(f"Captured: {path}")
+        print(f"Position: ({pos.x()}, {pos.y()})")
+        print(f"Size: {size[0]}x{size[1]}")
+
+    def on_canceled():
+        print("Selection canceled")
+
+    selector.area_captured.connect(on_captured)
+    selector.area_selection_canceled.connect(on_canceled)
+
+    if selector.start_capture():
+        print("Area selector started")
     else:
-        print("Ошибка запуска селектора области")
-    
+        print("Failed to start area selector")
+
     sys.exit(app.exec())
 
 

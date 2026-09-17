@@ -10,10 +10,9 @@ import threading
 import concurrent.futures
 import requests
 import re
-from PIL import ImageGrab, Image
 
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QPoint
+from PyQt6.QtCore import QObject, pyqtSignal, QPoint, QTimer, Qt
 from PyQt6.QtGui import QCursor, QIcon
 
 from tray_icon import TrayIcon
@@ -23,8 +22,27 @@ from ocr_manager import OCRManager
 from translator import TranslatorManager
 from screen_capture import ScreenCapture
 from overlay_window import TranslationOverlay as OverlayTranslationWindow, StartupLoaderWidget
+from area_selector import AreaSelector
 from settings import settings
 from ai_translator import SmartTranslator
+from text_formatter import TextFormatter, create_formatter_from_settings
+from translation_worker import TranslationPipelineWorker
+from constants import (
+    APP_NAME, OPENROUTER_MODELS_URL, OLLAMA_MODELS_URL,
+    OCR_INITIALIZATION_DELAY_SEC,
+    ERROR_API_KEY_MISSING, ERROR_MODEL_NO_IMAGE_SUPPORT, ERROR_TRANSLATION_FAILED,
+    ERROR_TEXT_NOT_SELECTED, ERROR_NETWORK, ERROR_API,
+    SUCCESS_TRANSLATION_RECEIVED, STATUS_AI_PROCESSING, STATUS_STANDARD_TRANSLATION,
+    STATUS_GOOGLE_UNAVAILABLE, STATUS_COPYING_TEXT, STATUS_TRANSLATING_TEXT
+)
+from utils import get_data_dir
+
+try:
+    from ollama_installer import OllamaUpdateCheckerWorker
+    HAS_OLLAMA_CHECKER = True
+except ImportError:
+    OllamaUpdateCheckerWorker = None
+    HAS_OLLAMA_CHECKER = False
 
 # Мини-картинка для проверки Vision
 TINY_JPEG_B64 = "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA="
@@ -44,22 +62,22 @@ class ScreenTextHelper(QObject):
         self.ocr_manager = OCRManager()
         self.translator_manager = TranslatorManager()
         self.screen_capture = ScreenCapture()
+        self.text_formatter = create_formatter_from_settings()
+        self.area_selector = AreaSelector()
         
         self.translation_window = None
         self.startup_loader = None
-        self.clipboard_poll_timer = None
-        self.clipboard_poll_counter = 0
         self.old_text_clipboard = ""
         self.last_translated_text = ""  
         self.is_running = False
         self.benchmark_mode = "startup"
+        self._current_pipeline_worker = None  # Ссылка на текущий воркер перевода
+        self._is_worker_busy = False  # Флаг занятости воркера
         self.setup_logging()
         
     def setup_logging(self):
         try:
-            appdata_root = os.environ.get("APPDATA", os.path.expanduser("~"))
-            app_dir = os.path.join(appdata_root, "ScreenTextHelper")
-            os.makedirs(app_dir, exist_ok=True)
+            app_dir = get_data_dir()
             log_file_path = os.path.join(app_dir, 'screentext_helper.log')
             
             logging.basicConfig(
@@ -97,7 +115,11 @@ class ScreenTextHelper(QObject):
             self.register_hotkeys()
             
             # Отложенный запуск OCR (ждём 3с, чтобы Qt полностью загрузился без DLL-конфликтов)
-            self.ocr_manager.start_initialization(delay_sec=3.0)
+            self.ocr_manager.start_initialization(delay_sec=OCR_INITIALIZATION_DELAY_SEC)
+
+            self._ollama_check_worker = None
+            if HAS_OLLAMA_CHECKER:
+                QTimer.singleShot(5000, self._start_ollama_background_check)
 
             self.logger.info("Приложение успешно инициализировано")
             return True
@@ -109,6 +131,10 @@ class ScreenTextHelper(QObject):
         self.tray_icon.show_settings.connect(self.show_settings)
         self.tray_icon.show_about.connect(self.show_about)
         self.tray_icon.quit_application.connect(self.quit_application)
+        
+        # Area selector signals
+        self.area_selector.area_captured.connect(self._on_area_captured)
+        self.area_selector.area_selection_canceled.connect(self._on_area_selection_canceled)
         
         def on_ready_event():
             self.startup_loader.set_loaded()
@@ -129,6 +155,23 @@ class ScreenTextHelper(QObject):
             time.sleep(0.05)
         except: pass
 
+    def _start_ollama_background_check(self):
+        if self._ollama_check_worker and self._ollama_check_worker.isRunning():
+            return
+        self._ollama_check_worker = OllamaUpdateCheckerWorker()
+        self._ollama_check_worker.update_available.connect(self._on_ollama_update_available)
+        self._ollama_check_worker.start()
+
+    def _on_ollama_update_available(self, current, latest):
+        try:
+            if self.startup_loader:
+                self.startup_loader.show_update_message(
+                    current, latest,
+                    on_click_callback=self.show_settings
+                )
+        except Exception:
+            pass
+
     def run_ai_benchmark(self):
         api_key = settings.get("llm.api_key")
         base_url = settings.get("llm.base_url").rstrip('/')
@@ -141,7 +184,7 @@ class ScreenTextHelper(QObject):
             self.ai_model_testing_signal.emit("__SCANNING__")
             candidates = []
             if "openrouter" in base_url.lower():
-                response = requests.get("https://openrouter.ai/api/v1/models", timeout=6)
+                response = requests.get(OPENROUTER_MODELS_URL, timeout=6)
                 if response.status_code == 200:
                     data = response.json().get("data", [])
                     for model in data:
@@ -223,112 +266,66 @@ class ScreenTextHelper(QObject):
             self.hotkey_manager.register_system_hotkeys(lambda: self.ocr_triggered.emit(), lambda: self.translate_triggered.emit())
         except: pass
     
-    def restart_snipping_tool(self):
-        try:
-            import subprocess
-            subprocess.run('taskkill /f /im SnippingTool.exe', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run('taskkill /f /im ScreenSketch.exe', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(0.1)  
-        except: pass
-            
     def handle_ocr_hotkey(self):
+        """Handle OCR hotkey - show area selector"""
+        # Защита от повторного вызова
+        if self._is_worker_busy:
+            self.logger.info("Игнорируем Ctrl+End: воркер занят")
+            return
+        if self.area_selector.isVisible():
+            self.logger.info("Игнорируем Ctrl+End: селектор уже открыт")
+            return
+        
         self.release_all_modifiers()
         self.old_text_clipboard = pyperclip.paste().strip()
-        pyperclip.copy("")
-        self.restart_snipping_tool()
-        time.sleep(0.25)
-        try:
-            pyautogui.hotkey('win', 'shift', 's')
-        except: pass
-        self.clipboard_poll_timer = QTimer()
-        self.clipboard_poll_counter = 0
-        self.clipboard_poll_timer.timeout.connect(self.poll_clipboard_for_image)
-        self.clipboard_poll_timer.start(250)  
-            
-    def poll_clipboard_for_image(self):
-        self.clipboard_poll_counter += 1
-        img = ImageGrab.grabclipboard()
-        if isinstance(img, Image.Image):
-            self.clipboard_poll_timer.stop()
-            ratio = 1.0
-            try: ratio = QApplication.primaryScreen().devicePixelRatio()
-            except: pass
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tf:
-                rgb_img = img.convert('RGB')
-                rgb_img.save(tf.name, format='JPEG', quality=85)
-                screenshot_path = tf.name
-            
-            if settings.get("llm.use_smart_translate", False):
-                self.startup_loader.set_text("ScreenText Helper", "ИИ обрабатывает область...")
-                QApplication.processEvents() 
-                ai = SmartTranslator()
-                current_model = settings.get("llm.model", "AI")
-                
-                if settings.get("llm.translate_with_standard_engine", False):
-                    orig_html, raw_orig_text = ai.translate_vision(screenshot_path)
-                    if raw_orig_text and not raw_orig_text.startswith("<b>Ошибка"):
-                        self.startup_loader.set_text("ScreenText Helper", "Стандартный перевод...")
-                        QApplication.processEvents()
-                        trans_t = self.translator_manager.translate_text(raw_orig_text)
-                        if not trans_t:
-                            self.startup_loader.set_text("ScreenText Helper", "Google недоступен, перевод через ИИ...")
-                            QApplication.processEvents()
-                            _, final_html = ai.translate_vision(screenshot_path, force_direct_translation=True)
-                        else:
-                            final_html = ai.format_text_to_html(trans_t)
-                    else:
-                        final_html = "<b>Ошибка распознавания</b>"
-                else:
-                    orig_html, final_html = ai.translate_vision(screenshot_path)
-                    
-                self.startup_loader.set_loaded("Перевод получен! 🎉")
-                
-                import re
-                clipboard_text = final_html.replace('</h1>', '\n\n').replace('</p>', '\n\n')
-                clean_text_for_clipboard = re.sub('<[^<]+?>', '', clipboard_text).strip()
-                self.last_translated_text = clean_text_for_clipboard
-                pyperclip.copy(clean_text_for_clipboard)
-                
-                cursor_pos = QCursor.pos()
-                orig_clipboard_text = orig_html.replace('</h1>', '\n\n').replace('</p>', '\n\n')
-                original_markdown = re.sub('<[^<]+?>', '', orig_clipboard_text).strip()
-                
-                self.show_translation_overlay(original_markdown, final_html, cursor_pos, (int(img.size[0]/ratio), int(img.size[1]/ratio)), orig_html, model_name=current_model)
-                if os.path.exists(screenshot_path): os.unlink(screenshot_path)
-                return
-            
-            if self.ocr_manager.reader is None:
-                self.startup_loader.set_loaded("OCR недоступен ❌ (EasyOCR не загружен)")
-                if os.path.exists(screenshot_path): os.unlink(screenshot_path)
-                return
-            ocr_data = self.ocr_manager.extract_text_from_area(screenshot_path, (0, 0, 0, 0))
-            if os.path.exists(screenshot_path): os.unlink(screenshot_path)
-            if not ocr_data: return
-            structured = self.structure_ocr_results(ocr_data)
-            orig_md, orig_h = self.post_process_text(structured)
-            clean_p = self.extract_paragraphs_from_lines(structured)
-            clean_t = "\n\n".join(clean_p)
-            if not clean_t.strip(): return
-            trans_t = self.translator_manager.translate_text(clean_t)
-            if not trans_t: return
-            if clean_t.isupper(): trans_t = trans_t.upper()
-            f_color = settings.get("font_color", "#000000")
-            p_sz = settings.get("font_size_p", 10)
-            final_h = "".join([f'<p style="font-family:\'Georgia\'; font-size:{p_sz}pt; text-align:justify; text-indent:25px; color:{f_color};">{l.strip()}</p>' for l in trans_t.split("\n") if l.strip()])
-            
-            import re
-            clipboard_text = final_h.replace('</h1>', '\n\n').replace('</p>', '\n\n')
-            clean_text_for_clipboard = re.sub('<[^<]+?>', '', clipboard_text).strip()
-            self.last_translated_text = clean_text_for_clipboard
-            pyperclip.copy(clean_text_for_clipboard)
-            
-            self.show_translation_overlay(orig_md, final_h, QCursor.pos(), (int(img.size[0]/ratio), int(img.size[1]/ratio)), orig_h)
-        elif self.clipboard_poll_counter > 80: self.clipboard_poll_timer.stop()
+        
+        # Show area selector
+        if not self.area_selector.start_capture():
+            self.startup_loader.set_loaded("Ошибка запуска селектора области")
+    
+    def _on_area_captured(self, file_path, screen_pos, physical_size):
+        """
+        Handle successful area capture from AreaSelector.
+        
+        Args:
+            file_path: Path to cropped screenshot
+            screen_pos: QPoint with logical screen position
+            physical_size: tuple (width, height) in physical pixels
+        """
+        # Verify the crop file exists before starting the worker
+        if not os.path.exists(file_path):
+            self.logger.error(
+                f"Файл скриншота не найден при запуске воркера: {file_path}"
+            )
+            self.startup_loader.set_loaded("Ошибка: файл скриншота не найден ❌")
+            return
+
+        self.logger.info(
+            f"Запуск воркера: файл={file_path}, "
+            f"позиция=({screen_pos.x()}, {screen_pos.y()}), "
+            f"размер={physical_size[0]}x{physical_size[1]}"
+        )
+        self.startup_loader.set_text(APP_NAME, STATUS_AI_PROCESSING)
+        
+        # Start pipeline worker with captured area
+        self._start_pipeline_worker(
+            mode=TranslationPipelineWorker.MODE_SCREENSHOT,
+            screenshot_path=file_path,
+            screenshot_size=physical_size
+        )
+    
+    def _on_area_selection_canceled(self):
+        """Handle area selection cancellation"""
+        pass  # No action needed - selector handles its own cleanup
 
     def handle_translate_selected_text(self):
+        # Защита от повторного вызова
+        if self._is_worker_busy:
+            self.logger.info("Игнорируем Ctrl+Home: воркер занят")
+            return
+        
         self.release_all_modifiers()
-        self.startup_loader.set_text("ScreenText Helper", "Копирование текста...")
+        self.startup_loader.set_text(APP_NAME, STATUS_COPYING_TEXT)
         QApplication.processEvents()
         pre_existing = pyperclip.paste().strip()
         temp_m = "---SCREENTEXT_TEMP_MARKER---"
@@ -342,113 +339,235 @@ class ScreenTextHelper(QObject):
             pyautogui.hotkey('ctrl', 'c'); time.sleep(0.15); sel = pyperclip.paste().strip()
         if (sel == temp_m or not sel) and pre_existing and pre_existing != temp_m: sel = pre_existing
         if not sel or sel == temp_m:
-            self.startup_loader.set_loaded("Ошибка: текст не выделен ❌"); return
-        self.startup_loader.set_text("ScreenText Helper", "Перевод текста...")
-        QApplication.processEvents()
-        raw = [l.strip() for l in sel.split("\n")]
-        cl = []
-        for i, line in enumerate(raw):
-            if line.endswith('-') and i < len(raw) - 1: cl.append(line[:-1])
-            else:
-                if i > 0 and raw[i-1].endswith('-'): cl[-1] = cl[-1] + line
-                else: cl.append(line)
-        para = []
-        cur = []
-        for l in cl:
-            if not l:
-                if cur: para.append(" ".join(cur)); cur = []
-            else: cur.append(l)
-        if cur: para.append(" ".join(cur))
-        clean_t = "\n\n".join(para)
-        trans_t = self.translator_manager.translate_text(clean_t)
-        if not trans_t: self.startup_loader.set_loaded("Ошибка перевода ❌"); return
-        self.startup_loader.set_loaded("Перевод получен! 🎉")
-        p_sz = settings.get("font_size_p", 10); f_color = settings.get("font_color", "#000000")
-        final_h = "".join([f'<p style="font-family:\'Georgia\'; font-size:{p_sz}pt; text-align:justify; text-indent:25px; color:{f_color};">{p.strip()}</p>' for p in trans_t.split("\n\n") if p.strip()])
-        orig_h = "".join([f'<p style="font-family:\'Georgia\'; font-size:{p_sz}pt; text-align:justify; text-indent:25px; color:{f_color};">{p.strip()}</p>' for p in para if p.strip()])
+            self.startup_loader.set_loaded(ERROR_TEXT_NOT_SELECTED); return
         
-        import re
-        clipboard_text = final_h.replace('</h1>', '\n\n').replace('</p>', '\n\n')
-        clean_text_for_clipboard = re.sub('<[^<]+?>', '', clipboard_text).strip()
-        self.last_translated_text = clean_text_for_clipboard
-        pyperclip.copy(clean_text_for_clipboard)
+        # Создаем и запускаем воркер для перевода текста
+        self._start_pipeline_worker(
+            mode=TranslationPipelineWorker.MODE_TEXT,
+            selected_text=sel
+        )
+    
+    def _start_pipeline_worker(self, mode, screenshot_path=None, screenshot_size=None, selected_text=None):
+        """
+        Запуск фонового воркера для обработки перевода.
         
-        self.show_translation_overlay(sel, final_h, QCursor.pos(), None, orig_h)
+        Args:
+            mode: Режим работы (MODE_SCREENSHOT или MODE_TEXT)
+            screenshot_path: Путь к файлу скриншота (для MODE_SCREENSHOT)
+            screenshot_size: Размер скриншота (для MODE_SCREENSHOT)
+            selected_text: Выделенный текст (для MODE_TEXT)
+        """
+        # Останавливаем предыдущий воркер если есть
+        if self._current_pipeline_worker is not None:
+            self._stop_pipeline_worker(self._current_pipeline_worker)
+        
+        # Создаем новый воркер
+        worker = TranslationPipelineWorker(mode=mode)
+        
+        # Устанавливаем параметры
+        if mode == TranslationPipelineWorker.MODE_SCREENSHOT:
+            worker.set_screenshot_params(screenshot_path, screenshot_size)
+        elif mode == TranslationPipelineWorker.MODE_TEXT:
+            worker.set_text_params(selected_text)
+        
+        # Подключаем сигналы
+        worker.status_changed.connect(self._on_pipeline_status_changed)
+        worker.finished_success.connect(self._on_pipeline_finished)
+        worker.failed.connect(self._on_pipeline_failed)
+        worker.stream_token.connect(self._on_pipeline_stream_token)
+        
+        # Сохраняем ссылку для предотвращения сборки мусора
+        self._current_pipeline_worker = worker
+        self._is_worker_busy = True
+        
+        # Запускаем
+        worker.start()
+    
+    def _stop_pipeline_worker(self, worker):
+        """
+        Безопасная остановка воркера:
+        1. Вызывает cancel() для мгновенного разрыва HTTP
+        2. Отключает все сигналы
+        3. Ждет завершения потока
+        """
+        if worker is None:
+            return
+        
+        # Отключаем сигналы ДО cancel, чтобы запоздалые события не летели в UI
+        self._disconnect_worker_signals(worker)
+        
+        # Мгновенная отмена (разрыв HTTP + флаг)
+        try:
+            worker.cancel()
+        except Exception:
+            pass
+        
+        # Ждем завершения потока (с таймаутом)
+        if worker.isRunning():
+            worker.wait(2000)
+            # Если всё ещё работает — принудительно
+            if worker.isRunning():
+                worker.terminate()
+    
+    def _disconnect_worker_signals(self, worker):
+        """Отключение всех сигналов воркера от слотов UI"""
+        try:
+            worker.status_changed.disconnect(self._on_pipeline_status_changed)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            worker.finished_success.disconnect(self._on_pipeline_finished)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            worker.failed.disconnect(self._on_pipeline_failed)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            worker.stream_token.disconnect(self._on_pipeline_stream_token)
+        except (TypeError, RuntimeError):
+            pass
+    
+    def _on_pipeline_stream_token(self, text_chunk: str):
+        """
+        Обработка токена стриминга от воркера.
+        Инициализирует оверлей при первом токене и скрывает лоадер.
+        """
+        # Инициализируем оверлей при первом токене стриминга
+        if self.translation_window is None or not self.translation_window.isVisible():
+            cursor_pos = QCursor.pos()
+            worker = self._current_pipeline_worker
             
+            if worker and worker.mode in (TranslationPipelineWorker.MODE_SCREENSHOT,
+                                          TranslationPipelineWorker.MODE_TEXT):
+                self.translation_window = OverlayTranslationWindow()
+                size = worker.screenshot_size if worker.mode == TranslationPipelineWorker.MODE_SCREENSHOT else None
+                model_name = getattr(worker, 'current_model', settings.get("llm.model", "AI"))
+                base_url = settings.get("llm.base_url", "")
+                self.translation_window.show_streaming(
+                    cursor_pos,
+                    size,
+                    model_name,
+                    base_url=base_url
+                )
+                # Скрываем лоадер - оверлей виден
+                if self.startup_loader:
+                    self.startup_loader.close()
+        
+        # Передаем токен в оверлей
+        if self.translation_window is not None:
+            self.translation_window.append_stream_token(text_chunk)
+    
+    def _on_pipeline_status_changed(self, status_text):
+        """Обработка обновления статуса от воркера"""
+        if self.startup_loader:
+            self.startup_loader.set_text(APP_NAME, status_text)
+    
+    def _on_pipeline_finished(self, result):
+        """Обработка успешного завершения воркера"""
+        self._is_worker_busy = False
+        try:
+            # Определяем был ли стриминг
+            was_streaming = (
+                self.translation_window is not None and 
+                self.translation_window._is_streaming
+            )
+            
+            # Завершаем стриминг если был активен
+            if was_streaming:
+                self.translation_window.finish_stream(
+                    final_trans_html=result.get('trans_html', ''),
+                    orig_html=result.get('orig_html', '')
+                )
+                # Гарантируем сохранение оригинала в оверлее
+                if self.translation_window:
+                    self.translation_window.set_original_text(
+                        result.get('orig_raw', ''),
+                        result.get('orig_html', '')
+                    )
+            
+            # Обновляем буфер обмена
+            if result.get('clean_clipboard'):
+                self.last_translated_text = result['clean_clipboard']
+                pyperclip.copy(result['clean_clipboard'])
+            
+            # Если стриминга не было - показываем оверлей классически
+            if not was_streaming:
+                cursor_pos = QCursor.pos()
+                self.show_translation_overlay(
+                    result.get('orig_raw', ''),
+                    result.get('trans_html', ''),
+                    cursor_pos,
+                    result.get('size'),
+                    result.get('orig_html'),
+                    model_name=result.get('model_name')
+                )
+            
+            # Скрываем лоадер
+            if self.startup_loader:
+                self.startup_loader.set_loaded(SUCCESS_TRANSLATION_RECEIVED)
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка обработки результата: {e}")
+            if self.startup_loader:
+                self.startup_loader.set_loaded(f"Ошибка: {e}")
+        finally:
+            # Очищаем ссылку на воркер
+            self._current_pipeline_worker = None
+    
+    def _on_pipeline_failed(self, error_text):
+        """Обработка ошибки от воркера"""
+        self._is_worker_busy = False
+        self.logger.error(f"Ошибка перевода: {error_text}")
+        
+        if self.translation_window is not None:
+            if self.translation_window._is_streaming:
+                self.translation_window.finish_stream()
+            
+            try:
+                self.translation_window.show_error(error_text)
+            except Exception:
+                self.translation_window.append_stream_token(f"\n\n❌ Ошибка: {error_text}")
+        
+        if self.startup_loader:
+            self.startup_loader.set_loaded(f"Ошибка: {error_text} ❌")
+        
+        self._current_pipeline_worker = None
+    
     def structure_ocr_results(self, results):
-        if not results: return []
-        blocks = []
-        for bbox, text, conf in results:
-            if conf > 0.4:
-                x0 = min(p[0] for p in bbox); x1 = max(p[0] for p in bbox); y0 = min(p[1] for p in bbox); y1 = max(p[1] for p in bbox)
-                blocks.append({'x0': x0, 'x1': x1, 'y0': y0, 'y1': y1, 'height': y1 - y0, 'cy': (y0 + y1) / 2, 'text': text})
-        if not blocks: return []
-        blocks.sort(key=lambda b: b['cy'])
-        lines = []
-        for b in blocks:
-            matched = False
-            for line in lines:
-                avg_cy = sum(item['cy'] for item in line) / len(line)
-                avg_h = sum(item['height'] for item in line) / len(line)
-                if abs(b['cy'] - avg_cy) < avg_h * 0.5: line.append(b); matched = True; break
-            if not matched: lines.append([b])
-        structured = []
-        for l in lines:
-            l.sort(key=lambda b: b['x0'])
-            structured.append({'text': " ".join(b['text'] for b in l).strip(), 'height': sum(b['height'] for b in l) / len(l), 'x0': l[0]['x0'], 'y0': l[0]['y0']})
-        return sorted(structured, key=lambda l: l['y0'])
-
+        """Обертка для TextFormatter.structure_ocr_results"""
+        return self.text_formatter.structure_ocr_results(results)
+    
     def extract_paragraphs_from_lines(self, sl):
-        if not sl: return []
-        avg_h = sum([l['height'] for l in sl]) / len(sl) if sl else 20
-        title = ""
-        body = sl
-        if len(sl) > 1 and sl[0]['height'] > avg_h * 1.15: title = sl[0]['text']; body = sl[1:]
-        cleaned = []
-        for i, line in enumerate(body):
-            text = line['text']
-            if text.endswith('-') and i < len(body) - 1: line['merge_next'] = True; line['clean_text'] = text[:-1]
-            else: line['merge_next'] = False; line['clean_text'] = text
-            cleaned.append(line)
-        para = []; cur = []
-        if title: para.append(title)
-        for i, line in enumerate(cleaned):
-            text = line['clean_text']
-            if not cur: cur.append(text)
-            else:
-                if cleaned[i-1].get('merge_next', False): cur[-1] = cur[-1] + text
-                else:
-                    if cleaned[i-1]['text'].endswith(('.', '!', '?')): para.append(" ".join(cur)); cur = [text]
-                    else: cur.append(text)
-        if cur: para.append(" ".join(cur))
-        return [p.replace(" . ", ". ").replace(" , ", ", ").replace(" )", ")").replace("( ", "(").strip() for p in para]
-
+        """Обертка для TextFormatter.extract_paragraphs_from_lines"""
+        return self.text_formatter.extract_paragraphs_from_lines(sl)
+    
     def post_process_text(self, sl):
-        p = self.extract_paragraphs_from_lines(sl)
-        if not p: return "", ""
-        avg_h = sum([l['height'] for l in sl]) / len(sl) if sl else 20
-        has_t = len(sl) > 1 and sl[0]['height'] > avg_h * 1.15
-        hl = []; ml = []; start = 0
-        f_c = settings.get("font_color", "#000000"); p_sz = settings.get("font_size_p", 10); h1_sz = settings.get("font_size_h1", 14)
-        if has_t:
-            hl.append(f'<h1 style="font-family:\'Segoe UI\'; font-size:{h1_sz}pt; font-weight:bold; text-align:center; color:{f_c};">{p[0]}</h1>')
-            ml.append(f"# {p[0]}\n"); start = 1
-        for pr in p[start:]:
-            hl.append(f'<p style="font-family:\'Georgia\'; font-size:{p_sz}pt; text-align:justify; text-indent:25px; color:{f_c};">{pr}</p>')
-            ml.append(pr)
-        return "\n\n".join(ml), "".join(hl)
+        """Обертка для TextFormatter.post_process_text"""
+        return self.text_formatter.post_process_text(sl)
     
     def show_translation_overlay(self, orig, trans, pos, size=None, orig_h=None, model_name=None):
+        base_url = settings.get("llm.base_url", "")
         self.translation_window = OverlayTranslationWindow()
-        self.translation_window.show_translation(orig, trans, pos, size, orig_h, model_name=model_name)
+        self.translation_window.show_translation(orig, trans, pos, size, orig_h, model_name=model_name, base_url=base_url)
     
     def show_settings(self):
         try:
+            if self.settings_window is not None and self.settings_window.isVisible():
+                self.settings_window.setWindowState(
+                    self.settings_window.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive
+                )
+                self.settings_window.raise_()
+                self.settings_window.activateWindow()
+                return
+
             self.settings_window = SettingsWindow()
             self.settings_window.run_benchmark_requested.connect(self.run_on_demand_benchmark)
             self.settings_window.settings_saved.connect(self.on_settings_saved)
             self.settings_window.ocr_reload_requested.connect(self.on_ocr_reload_requested)
             self.settings_window.show()
+            self.settings_window.raise_()
+            self.settings_window.activateWindow()
         except Exception as e:
             self.logger.error(f"Ошибка открытия окна настроек: {e}")
     
@@ -591,7 +710,21 @@ class ScreenTextHelper(QObject):
         self.ocr_manager.reinitialize_ocr()
 
     def quit_application(self):
-        self.hotkey_manager.stop_listening(); self.app.quit()
+        self._cleanup_orphaned_temp_files()
+        self.hotkey_manager.stop_listening()
+        self.app.quit()
+    
+    def _cleanup_orphaned_temp_files(self):
+        """Удаление зависших временных файлов скриншотов при выходе"""
+        import tempfile
+        import glob
+        temp_dir = tempfile.gettempdir()
+        for pattern in ('screentext_*.png', 'screentext_*.jpg'):
+            for fpath in glob.glob(os.path.join(temp_dir, pattern)):
+                try:
+                    os.unlink(fpath)
+                except Exception:
+                    pass
     
     def on_settings_saved(self):
         self.hotkey_manager.unregister_all_hotkeys(); self.register_hotkeys()

@@ -15,6 +15,7 @@ from typing import List, Dict, Optional, Tuple
 from PIL import Image
 import pyperclip
 from settings import settings
+from utils import get_resource_path
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -35,11 +36,7 @@ _get_numpy._module = None
 
 
 def _get_bundled_model_path():
-    if getattr(sys, 'frozen', False):
-        base = sys._MEIPASS
-    else:
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    candidate = os.path.join(base, 'easyocr_models')
+    candidate = get_resource_path('easyocr_models')
     if os.path.isdir(candidate):
         return candidate
     return None

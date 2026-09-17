@@ -10,6 +10,7 @@ from PyQt6.QtCore import QSharedMemory
 
 def main_entry():
     # 1. Рассчитываем корневую директорию проекта и переходим в нее
+    # Используем sys.executable для frozen (--onedir), __file__ для dev
     if getattr(sys, 'frozen', False):
         project_root = os.path.dirname(sys.executable)
     else:
